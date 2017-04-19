@@ -12,6 +12,7 @@ import random
 from PIL import Image
 import matplotlib
 import matplotlib.pyplot as plt
+from itertools import count
 
 SCREEN_HEIGHT = 210
 SCREEN_WIDTH = 160
@@ -21,10 +22,12 @@ EPS_START = 0.9
 EPS_END = 0.05
 EPS_DECAY = 200
 USE_CUDA = torch.cuda.is_available()
+NUM_EPISODES = 1000
 
-env = gym.make('Pong-v0').unwrapped
 
-ACTION_SPACE = len(env.action_space)
+env = gym.make('Breakout-v0').unwrapped
+
+ACTION_SPACE = env.action_space.n
 
 Transition = namedtuple('Transition',
                         ('state', 'action', 'next_state', 'reward'))
@@ -81,34 +84,31 @@ resize = T.Compose([
 def get_screen():
     # torch rgb order, channel, height, width
     screen = env.render(mode='rgb_array')
-    print(type(screen))
-    print(type(resize(screen)))
+    # print(type(screen))
+    # print(type(resize(screen)))
 
 
     '''
     ToPILImage
-    Converts a torch.*Tensor of shape C x H x W or a numpy ndarray of shape H x W x C to a PIL.Image while preserving 
+    Converts a torch.*Tensor of shape C x H x W or a numpy ndarray of shape H x W x C to a PIL.Image while preserving
     value range.
     '''
 
     '''
     Scale
-    Rescales the input PIL.Image to the given ‘size’. If ‘size’ is a 2-element tuple or list in the order of 
-    (width, height), it will be the exactly size to scale. If ‘size’ is a number, it will indicate the size of the 
-    smaller edge. For example, if height > width, then image will be rescaled to (size * height / width, size) 
+    Rescales the input PIL.Image to the given ‘size’. If ‘size’ is a 2-element tuple or list in the order of
+    (width, height), it will be the exactly size to scale. If ‘size’ is a number, it will indicate the size of the
+    smaller edge. For example, if height > width, then image will be rescaled to (size * height / width, size)
     size: size of the exactly size or the smaller edge interpolation: Default: PIL.Image.BILINEAR
     '''
 
     '''
     ToTensor()
-    Converts a PIL.Image or numpy.ndarray (H x W x C) in the range [0, 255] to a torch.FloatTensor of shape (C x H x W) 
+    Converts a PIL.Image or numpy.ndarray (H x W x C) in the range [0, 255] to a torch.FloatTensor of shape (C x H x W)
     in the range [0.0, 1.0].
     '''
 
-    if USE_CUDA:
-        return resize(screen).unsqueeze(0).cuda()
-    else:
-        return resize(screen).unsqueeze(0)  # convert to size batch*C*H*W
+    return resize(screen).unsqueeze(0)  # convert to size batch*C*H*W
 
 
 # env.reset()
@@ -135,13 +135,19 @@ def select_action(state):
     eps_threshold = EPS_END + (EPS_START - EPS_END) * math.exp(-1 * steps_done/EPS_DECAY)
     steps_done += 1
     if sample > eps_threshold:
-        return model(Variable(state, volatile=True)).data.max(1)[1].cpu()
+        state = state.cuda()
+        var_z = Variable(state, volatile=True)
+        # var_z.data = var_z.data.cuda()
+        output_z = model(var_z)
+        return_z = output_z.data.max(1)[1]
+        return return_z.cpu()
     else:
         return torch.LongTensor([[random.randrange(ACTION_SPACE)]])
 
 
 def optimize_model():
     global last_sync
+
     if len(memory) < BATCH_SIZE:
         return
     transition = memory.sample(BATCH_SIZE)
@@ -149,10 +155,82 @@ def optimize_model():
 
     # find the none final state
     non_final_mask = torch.ByteTensor(
-        tuple()
+        tuple(map(lambda s: s is not None, batch.next_state))
     )
-#
+
+    non_final_next_states = Variable(torch.cat([s for s in batch.next_state
+                                                if s is not None]),
+                                     volatile=True)
+    state_batch = Variable(torch.cat(batch.state))
+    action_batch = Variable(torch.cat(batch.action))
+    reward_batch = Variable(torch.cat(batch.reward))
+
+    if USE_CUDA:
+        state_batch = state_batch.cuda()
+        action_batch = action_batch.cuda()
+        reward_batch = reward_batch.cuda()
+        non_final_next_states = non_final_next_states.cuda()
+        non_final_mask = non_final_mask.cuda()
+
+
+    state_action_values = model(state_batch).gather(1, action_batch)
+
+    if USE_CUDA:
+        next_state_values = Variable(torch.zeros(BATCH_SIZE).cuda())
+    else:
+        next_state_values = Variable(torch.zeros(BATCH_SIZE))
+
+    next_state_values[non_final_mask] = model(non_final_next_states).max(1)[0]
+
+    next_state_values.volatile = False
+    expected_state_action_values = (next_state_values * GAMMA) + reward_batch
+    loss = F.smooth_l1_loss(state_action_values, expected_state_action_values)
+
+    optimizer.zero_grad()
+    loss.backward()
+    for param in model.parameters():
+        param.grad.data.clamp_(-1, 1)
+    optimizer.step()
 
 
 
+episode_durations = []
 
+for i_episode in range(NUM_EPISODES):
+
+    # Initialize the environment and state
+    env.reset()
+    last_screen = get_screen()
+    current_screen = get_screen()
+    state = current_screen - last_screen
+
+    for t in count():
+        # Select and perform an action
+        action = select_action(state)
+        _, reward, done, _ = env.step(action[0, 0])
+        # env.render()
+        reward = torch.Tensor([reward])
+
+        # Observe new state
+        last_screen = current_screen
+        current_screen = get_screen()
+        if not done:
+            next_state = current_screen - last_screen
+        else:
+            next_state = None
+
+        # Store the transition in memory
+        memory.push(state, action, next_state, reward)
+
+        # Move to the next state
+        state = next_state
+
+        # Perform one step of the optimization (on the target network)
+        optimize_model()
+        if done:
+            # output = "episode: {episode:f}; loss: {loss:.4f}; reward: {reward: .2f}; avg_max_q: {q: .4f}".format(episode=t+1, loss=e_loss/(t+1), reward=e_reward, q=e_avgQ/(t+1))
+            print("eps: %d; duration: %d" % (i_episode, t+1))
+            break;
+
+torch.save(model.state_dict(), 'model1_0418.pth')
+env.close()
